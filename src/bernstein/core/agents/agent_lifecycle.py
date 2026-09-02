@@ -1261,6 +1261,22 @@ def _handle_failure_detection(
     if _rl_tracker is None or not session.provider:
         return False
 
+    # A process that exited 0 did not die of anything. The scanner greps the
+    # agent's transcript for risky substrings ("401", "rate limit", "timeout"),
+    # and an agent MENTIONING one is not an agent that failed on one: a task
+    # about auth code legitimately prints "HTTP 401" in its final message. On
+    # 2026-09-02 that failed a task whose work had already merged, twice
+    # retried it and DLQ'd it. Log patterns are evidence only for a session
+    # that actually died; a clean exit falls through to the orphan path, which
+    # auto-completes it.
+    if session.exit_code == 0:
+        logger.info(
+            "_handle_failure_detection: session %s exited 0 (task=%s); not failing on log patterns",
+            session.id,
+            task_id,
+        )
+        return False
+
     _log_path = _resolve_agent_log_path(orch._workdir, session)
     logger.debug(
         "_handle_failure_detection: scanning log_path=%s for session=%s provider=%r task=%s",
