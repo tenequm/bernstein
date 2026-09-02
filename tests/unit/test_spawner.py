@@ -1280,9 +1280,15 @@ class TestWorktreeIntegration:
         assert "Fix worktree CLAUDE.md injection" in content
         assert "spawner_core.py" in content
 
-    def test_spawn_falls_back_on_worktree_error(
-        self, tmp_path: Path, make_task, mock_adapter_factory, caplog: pytest.LogCaptureFixture
+    def test_spawn_refuses_operator_checkout_on_worktree_error(
+        self, tmp_path: Path, make_task, mock_adapter_factory
     ) -> None:
+        """Worktree creation failure must fail the spawn, never fall back to the root.
+
+        The old fallback ran the agent in the operator checkout, where it commits
+        over the checked-out branch and reap-time salvage renames that branch to
+        ``salvage/<session>``.
+        """
         adapter = mock_adapter_factory(pid=300)
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
@@ -1290,14 +1296,10 @@ class TestWorktreeIntegration:
         spawner = AgentSpawner(adapter, templates_dir, tmp_path, use_worktrees=True, default_model="mock-model")
         with patch.object(spawner._worktree_mgr, "create", side_effect=WorktreeError("git failed")):
             task = make_task()
-            spawner.spawn_for_tasks([task])
+            with pytest.raises(SpawnError, match="Refusing to fall back to the operator checkout"):
+                spawner.spawn_for_tasks([task])
 
-        # Adapter was spawned with the main workdir as fallback
-        call_kwargs = adapter.spawn.call_args.kwargs
-        assert call_kwargs["workdir"] == tmp_path
-
-        # Warning was logged about the worktree failure
-        assert any("falling back to main workdir" in r.message for r in caplog.records)
+        adapter.spawn.assert_not_called()
 
     def test_spawn_without_worktrees_uses_workdir(self, tmp_path: Path, make_task, mock_adapter_factory) -> None:
         adapter = mock_adapter_factory(pid=400)

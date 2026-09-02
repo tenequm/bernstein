@@ -64,7 +64,8 @@ async def test_worktree_creation_failure(
         orch.tick()
 
         # 3. Verify
-        # Agent was spawned anyway (due to fallback)
-        assert len(spawned_workdirs) == 1
-        # Fallback workdir is the main repo (integration_sdd.parent)
-        assert spawned_workdirs[0] == integration_sdd.parent
+        # No fallback to the operator checkout: the spawn is refused outright.
+        # Running at the root lets the agent commit over the checked-out branch
+        # and lets reap-time salvage rename that branch to salvage/<session>.
+        assert spawned_workdirs == []
+        assert integration_sdd.parent not in spawned_workdirs

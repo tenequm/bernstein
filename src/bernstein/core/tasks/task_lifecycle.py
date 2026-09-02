@@ -2832,6 +2832,20 @@ def claim_and_spawn_batches(
                 (orch._preserved_worktrees[t.id] for t in batch if t.id in orch._preserved_worktrees),
                 None,
             )
+            # A preserved worktree that has since been removed (merge cleanup or
+            # the orphan pruner) is not a resume target: resuming into the stale
+            # path re-creates it as a plain directory inside the repo, where every
+            # git command walks up and resolves to the OPERATOR checkout - which is
+            # how a merged task's salvage renamed the integration branch away.
+            # Drop the dangling entry and spawn cold instead.
+            if resume_worktree is not None and not resume_worktree.is_dir():
+                logger.warning(
+                    "Preserved worktree %s no longer exists; spawning cold instead of resuming",
+                    resume_worktree,
+                )
+                for _t in batch:
+                    orch._preserved_worktrees.pop(_t.id, None)
+                resume_worktree = None
             if resume_worktree is not None:
                 changed_files = _get_changed_files_in_worktree(resume_worktree)
                 session = orch._spawner.spawn_for_resume(

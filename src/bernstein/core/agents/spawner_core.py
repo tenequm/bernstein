@@ -436,6 +436,32 @@ def manager_write_boundary_error(
     )
 
 
+def refuse_operator_checkout_cwd(spawn_cwd: Path, workdir: Path, session_id: str) -> None:
+    """Refuse a spawn whose cwd is the operator checkout itself.
+
+    Isolation invariant. Every route that ends with ``spawn_cwd == workdir``
+    while worktree isolation is on is a bug, and the blast radius is the
+    operator's own branch: an agent at the root commits ``.sdd`` and the
+    reap-time salvage then renames the checked-out integration branch to
+    ``salvage/<session>``, losing it. Previously these routes only warned and
+    continued (the worktree-creation fallback) or were never checked at all
+    (the resume path, which takes a caller-supplied worktree). Failing the
+    spawn loudly costs one task; running at the root costs the branch.
+
+    Raises:
+        SpawnError: when *spawn_cwd* resolves to *workdir*.
+    """
+    if spawn_cwd.resolve() != workdir.resolve():
+        return
+    raise SpawnError(
+        f"Refusing to spawn agent {session_id} in the operator checkout {workdir}: "
+        "worktree isolation is enabled but no per-session worktree was resolved. "
+        "An agent at the repo root commits over the operator's branch and its salvage "
+        "renames that branch away. Fix: check .sdd/worktrees/ for a stale entry, run "
+        "`git worktree prune`, and retry."
+    )
+
+
 # Operator-checkout subtrees that are never a planning-agent stray write:
 # ``.sdd`` is Bernstein's own runtime state and ``.git`` is VCS metadata.
 _MANAGER_STRAY_IGNORED_TOP = frozenset({".sdd", ".git"})
@@ -4503,15 +4529,21 @@ class AgentSpawner:
                     self._worktree_paths[session_id] = spawn_cwd
                     self._worktree_roots[session_id] = worktree_repo_root
                 except WorktreeError as exc:
-                    logger.warning(
-                        "Worktree creation failed for session %s (%s), falling back to main workdir: %s",
-                        session_id,
-                        exc,
-                        self._workdir,
-                    )
-                    spawn_cwd = self._workdir
-                    self._worktree_paths[session_id] = self._workdir
-                    self._worktree_roots[session_id] = worktree_repo_root
+                    # No fallback to the main workdir: the agent would run in the
+                    # operator checkout, commit over its branch and have salvage
+                    # rename that branch to salvage/<session>. Fail the task instead.
+                    raise SpawnError(
+                        f"Worktree creation failed for session {session_id}: {exc}. "
+                        "Refusing to fall back to the operator checkout. "
+                        "Fix: `git worktree prune`, remove any stale .sdd/worktrees/ entry, and retry."
+                    ) from exc
+
+        # Single choke point: spawn_cwd is final here. With worktree isolation on,
+        # no route (warm pool, artifact workspace, worktree create, multi-repo
+        # resolution) may leave the agent in the operator checkout.
+        if self._use_worktrees and worktree_mgr is not None:
+            refuse_operator_checkout_cwd(spawn_cwd, worktree_repo_root, session_id)
+            refuse_operator_checkout_cwd(spawn_cwd, self._workdir, session_id)
 
         # Leak guard (issue #2996): from here to the success return, any
         # exception that escapes this spawn - a sampling-params refusal, a
@@ -5357,6 +5389,20 @@ class AgentSpawner:
         # same gate or a sovereign run could resume an agent after the posture
         # drifted. A hard stop (``PostureDriftRefusal``), same as the main path.
         self._preflight_posture_drift()
+
+        # The resume path never allocates a worktree: it spawns into whatever the
+        # caller preserved in ``orch._preserved_worktrees``. That path is only ever
+        # correct if it is a per-session checkout, so apply the same isolation
+        # invariant the fresh-spawn choke point applies, and refuse a preserved
+        # path that has since been removed rather than letting git walk up to the
+        # operator checkout from a stale directory.
+        if self._use_worktrees:
+            refuse_operator_checkout_cwd(worktree_path, self._workdir, "<resume>")
+        if not worktree_path.exists():
+            raise SpawnError(
+                f"Refusing to resume in {worktree_path}: the preserved worktree no longer "
+                "exists (removed after a merge or reap). Fix: let the task respawn cold."
+            )
 
         # Build resume context prefix
         files_list = "\n".join(f"  - {f}" for f in changed_files) if changed_files else "  (none)"
