@@ -141,3 +141,26 @@ def test_validator_still_reports_a_genuinely_failed_dependency() -> None:
 
     result = DependencyValidator().validate([failed, judge])
     assert result.stuck_deps == [("B", "A", "failed")]
+
+
+def test_validator_is_quiet_while_the_retry_is_still_in_flight() -> None:
+    """The engine is re-attempting the dependency; the dependent is not wedged."""
+    from bernstein.core.quality.dep_validator import DependencyValidator
+
+    failed = _task("A", "failed")
+    in_flight = _task("A-retry", "in_progress", meta={"original_task_id": "A", "retry_of": "A"})
+    dependent = _task("B", "open", deps=["A"])
+
+    result = DependencyValidator().validate([failed, in_flight, dependent])
+    assert result.stuck_deps == []
+
+
+def test_validator_reports_it_again_once_every_retry_has_failed() -> None:
+    from bernstein.core.quality.dep_validator import DependencyValidator
+
+    failed = _task("A", "failed")
+    dead_retry = _task("A-retry", "failed", meta={"original_task_id": "A", "retry_of": "A"})
+    dependent = _task("B", "open", deps=["A"])
+
+    result = DependencyValidator().validate([failed, dead_retry, dependent])
+    assert result.stuck_deps == [("B", "A", "failed")]
