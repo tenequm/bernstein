@@ -1226,6 +1226,18 @@ def _orchestrator_liveness(
 #: before the run is declared over. A poll that could not reach the server is
 #: not an observation and resets the count: see
 #: ``_ORCHESTRATOR_GONE_CONFIRM_WINDOW_S``.
+# A failed task is not the end of a run: the orchestrator queues its retry on a
+# LATER tick, and between the two the board holds nothing open, nothing claimed
+# and no live agent - which is indistinguishable from a finished run. Measured
+# 2026-09-03: the stale-claim releaser failed a task at 01:30:04 and
+# maybe_retry_task created the retry at 01:30:28, and the CLI called the run
+# terminal 2 s into that 24 s window, printed `Done: 0, Failed: 1` and exited
+# while the run went on for another 40 minutes. So a quiescent board that
+# contains an unsuccessful terminal task has to be re-observed across this
+# window before it is believed. A run whose tasks all succeeded has no retry to
+# wait for and still exits on the first observation.
+_QUIESCENCE_RETRY_CONFIRM_WINDOW_S = 45.0
+
 _ORCHESTRATOR_GONE_CONFIRMATIONS = 3
 #: Monotonic seconds the confirming observations must span, derived from the
 #: recovery supervisor's poll period rather than picked: ``run_watchdog`` in
@@ -1290,6 +1302,20 @@ def _incomplete_declared_counts(status_payload: dict[str, Any]) -> tuple[int, di
     if isinstance(full_counts, dict) and _looks_like_status_histogram(full_counts):
         return count_incomplete_declared(full_counts), full_counts
     return count_incomplete_declared(status_payload), None
+
+
+def _has_unsuccessful_terminal_task(full_counts: dict[str, Any] | None) -> bool:
+    """Does the run hold a task that ended without delivering, and may retry?
+
+    Answered from the full per-status histogram only. Without it the answer is
+    False: an undercount must not be read as "a retry may be pending" and hold a
+    finished run open for the confirmation window.
+    """
+    if not isinstance(full_counts, dict):
+        return False
+    from bernstein.core.tasks.lifecycle import UNSUCCESSFUL_TERMINAL_STATUSES
+
+    return any(int(full_counts.get(status.value, 0) or 0) > 0 for status in UNSUCCESSFUL_TERMINAL_STATUSES)
 
 
 def _is_quiescent(
@@ -1513,6 +1539,7 @@ def _wait_for_run_completion(
     gone_last_seen: float | None = None
     gone_polls = 0
     gone_pid: int | None = None
+    quiescent_since: float | None = None
 
     def _reset_streak(reason: str, **fields: Any) -> None:
         nonlocal gone_since, gone_last_seen, gone_polls, gone_pid
@@ -1568,6 +1595,20 @@ def _wait_for_run_completion(
                     "/status) - continuing to wait",
                     n_incomplete,
                 )
+            if quiescent and _has_unsuccessful_terminal_task(full_counts):
+                if quiescent_since is None:
+                    quiescent_since = mono
+                    logger.info(
+                        "run_quiescent_pending_retry_confirmation: the board is quiescent but holds a "
+                        "failed/orphaned task, whose retry is queued on a later tick - re-observing for %.0fs",
+                        _QUIESCENCE_RETRY_CONFIRM_WINDOW_S,
+                    )
+                    quiescent = False
+                elif mono - quiescent_since < _QUIESCENCE_RETRY_CONFIRM_WINDOW_S:
+                    quiescent = False
+            elif not quiescent:
+                quiescent_since = None
+
             if quiescent:
                 logger.info(
                     "run_completion_detected: total=%d open=%d claimed=%d agent_count=%d "

@@ -2753,10 +2753,19 @@ class Orchestrator:
             return
 
         settled_agents = sum(1 for a in self._agents.values() if a.status != "dead")
-        if settled["done"] or settled["failed"] or len(settled["open"]) or settled_agents:
+        # Only RUNNABLE work aborts the stop. ``done`` and ``failed`` are
+        # terminal buckets that only ever grow, so testing them here meant that
+        # once any task had finished or failed the confirmation could never
+        # pass again and the stall backstop was dead for the rest of the run -
+        # measured 2026-09-03: one done + one failed task, and the orchestrator
+        # was still ticking 36 minutes past the grace with nothing to do, until
+        # the operator killed it. The settle window's job is to catch work that
+        # ARRIVES during it, which is an open task or a live agent.
+        if len(settled["open"]) or settled_agents:
             logger.info(
                 "run_stall_check: NOT confirmed after %.1fs settle window (tick #%d): "
-                "open=%d agents=%d done=%d failed=%d - run continues",
+                "open=%d agents=%d (done=%d failed=%d are terminal and do not abort the stop)"
+                " - run continues",
                 _settle_s,
                 self._tick_count,
                 len(settled["open"]),
