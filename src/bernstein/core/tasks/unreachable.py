@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
     from bernstein.core.tasks.models import Task
 
-__all__ = ["blocking_dependency", "unreachable_tasks"]
+__all__ = ["blocking_dependency", "satisfied_dependency_ids", "unreachable_tasks"]
 
 
 def dependency_can_never_satisfy(dependency: Task) -> bool:
@@ -56,6 +56,35 @@ def _is_task_succeeded_or_retrying(dep_id: str, tasks: Mapping[str, Task]) -> bo
             if (orig == dep_id or retry_of == dep_id) and t.status not in UNSUCCESSFUL_TERMINAL_STATUSES:
                 return True
     return False
+
+
+def satisfied_dependency_ids(completed: Iterable[Task]) -> set[str]:
+    """Return every dependency id that *completed* satisfies, lineage included.
+
+    ``retry_or_fail_task`` mints a NEW task id for a retry and leaves every
+    dependent's ``depends_on`` pointing at the original, so a retry that
+    succeeds satisfies an edge that names an id it does not have. Its lineage
+    is recorded in ``metadata["original_task_id"]`` / ``["retry_of"]``, and
+    resolving through those is what the rest of the model already does
+    (``_is_task_succeeded_or_retrying`` above, ``TaskStore``'s claim check,
+    ``DAGExecutor.resolve_edge``). The orchestrator's own readiness filter
+    carried a raw ``{t.id}`` set instead, so a successful retry could never
+    unblock the DAG - measured 2026-09-03: retry ``2d996831f7f2`` reached done
+    while three dependents on ``4e86bcefa22a`` stayed open for the whole run.
+
+    Callers pass the tasks in a successful terminal status (done and closed);
+    this answers only "which ids do these satisfy", never which are successful.
+    """
+    ids: set[str] = set()
+    for task in completed:
+        ids.add(task.id)
+        if not isinstance(task.metadata, dict):
+            continue
+        for key in ("original_task_id", "retry_of"):
+            value = task.metadata.get(key)
+            if isinstance(value, str) and value:
+                ids.add(value)
+    return ids
 
 
 def blocking_dependency(task: Task, tasks: Mapping[str, Task]) -> str | None:
