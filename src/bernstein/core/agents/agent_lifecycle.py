@@ -1970,6 +1970,38 @@ def _handle_orphan_no_signals(
         )
         return _try_auto_complete(orch, task_id, base, summary, log_msg, session=session, start_ts=start_ts)
     if clean_exit:
+        # "Empty diff" above is read from COMMITTED state only. An agent that
+        # wrote its deliverable and died before committing is not an agent that
+        # decided nothing needed changing, and auto-completing it records a
+        # deliverable that exists in no ref while the work sits in the worktree
+        # (finding K, 2026-09-03).
+        _uncommitted = _uncommitted_work_paths(worktree_path)
+        if _uncommitted:
+            logger.warning(
+                "NOT auto-completing task %s: agent %s exited cleanly with no commits, but its "
+                "worktree holds %d uncommitted path(s) - the work was written and never landed on "
+                "any ref. Failing it as unverified so the retry can finish the job. First paths: %s",
+                task_id,
+                session.id,
+                len(_uncommitted),
+                _uncommitted[:5],
+            )
+            try:
+                retry_or_fail_task(
+                    task_id,
+                    f"Agent {session.id} exited cleanly leaving {len(_uncommitted)} uncommitted "
+                    f"path(s) in its worktree - the deliverable was written but never committed",
+                    client=orch._client,
+                    server_url=base,
+                    max_task_retries=orch._config.max_task_retries,
+                    retried_task_ids=orch._retried_task_ids,
+                    workdir=getattr(orch, "_workdir", None),
+                    **_retry_escalation_context(orch),
+                )
+            except httpx.HTTPError as exc:
+                logger.error("Failed to retry/fail uncommitted clean-exit task %s: %s", task_id, exc)
+            return False, "clean_exit_uncommitted_work"
+
         # A clean exit (code 0) with an empty diff and no completion signals is
         # only a genuine "no changes needed" completion when the agent actually
         # ran long enough to have done the work. _probe_fast_exit() flags a
@@ -2610,6 +2642,39 @@ def check_stale_agents(orch: Any) -> None:
 def check_stalled_tasks(orch: Any) -> None:
     """Delegate stall checks to the shared heartbeat module."""
     heartbeat_protocol.check_stalled_tasks(orch)
+
+
+def _uncommitted_work_paths(worktree_path: Path | None) -> list[str]:
+    """Return the worktree's uncommitted paths (tracked edits + untracked).
+
+    ``files_modified`` and ``_has_git_commits_on_branch`` are both read from
+    COMMITTED state, so an agent that wrote its whole deliverable and died
+    before committing looks identical to one that decided nothing needed
+    changing. Measured 2026-09-03: an agent was auto-completed on an "empty
+    diff (exit code 0)" while its worktree held 14 written files, which
+    Bernstein's own salvage then captured as a patch.
+
+    ``git status --porcelain`` already honours ``.gitignore``. Any failure
+    returns an empty list: this only ever suppresses an auto-completion, and
+    guessing "dirty" from a broken git call would fail healthy tasks.
+    """
+    if worktree_path is None:
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(worktree_path),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+        return [line for line in result.stdout.splitlines() if line.strip()]
+    except Exception:
+        return []
 
 
 def _has_git_commits_on_branch(worktree_path: Path, since_ts: float) -> bool:
