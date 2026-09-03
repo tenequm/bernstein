@@ -114,3 +114,30 @@ async def test_b_unblocks_once_a_s_retry_succeeds(tmp_path: Path) -> None:
 
     assert store._dependencies_satisfied(b) is True, "a successful retry must satisfy B's edge on A"
     assert b.status is not TaskStatus.BLOCKED_BY_FAILED_DEP, "B must be unblocked, not stranded"
+
+
+# ---------------------------------------------------------------------------
+# The diagnostic validator must not report a satisfied edge as stuck
+# ---------------------------------------------------------------------------
+
+
+def test_validator_does_not_report_a_retried_dependency_as_stuck() -> None:
+    """`depends on X which is failed - task remains blocked` for a running dependent."""
+    from bernstein.core.quality.dep_validator import DependencyValidator
+
+    failed = _task("4e86bcefa22a", "failed")
+    retry = _task("2d996831f7f2", "done", meta={"original_task_id": "4e86bcefa22a", "retry_of": "4e86bcefa22a"})
+    judge = _task("372cf846f93e", "open", deps=["4e86bcefa22a"])
+
+    result = DependencyValidator().validate([failed, retry, judge])
+    assert result.stuck_deps == [], "the retry satisfies the edge; nothing is stuck"
+
+
+def test_validator_still_reports_a_genuinely_failed_dependency() -> None:
+    from bernstein.core.quality.dep_validator import DependencyValidator
+
+    failed = _task("A", "failed")
+    judge = _task("B", "open", deps=["A"])
+
+    result = DependencyValidator().validate([failed, judge])
+    assert result.stuck_deps == [("B", "A", "failed")]

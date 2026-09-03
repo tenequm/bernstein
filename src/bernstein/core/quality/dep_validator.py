@@ -19,6 +19,10 @@ class DepValidationResult:
     warnings: list[str]
 
 
+from bernstein.core.tasks.lifecycle import SUCCESSFUL_TASK_STATUSES
+from bernstein.core.tasks.unreachable import satisfied_dependency_ids
+
+
 class DependencyValidator:
     """Validate task dependency graphs before scheduling."""
 
@@ -27,6 +31,14 @@ class DependencyValidator:
     def validate(self, tasks: list[Task]) -> DepValidationResult:
         """Run full validation for the current task set."""
         task_map = {task.id: task for task in tasks}
+        # A dependency whose RETRY has since succeeded is not stuck: the retry
+        # carries a new id and the edge still names the original, so a raw
+        # status read reports "depends on X which is failed - task remains
+        # blocked" for a dependent that is already running. Same lineage fold
+        # the readiness filter and the store's claim check use.
+        satisfied = satisfied_dependency_ids(
+            task for task in tasks if task.status in SUCCESSFUL_TASK_STATUSES
+        )
         missing: list[tuple[str, str]] = []
         stuck: list[tuple[str, str, str]] = []
         warnings: list[str] = []
@@ -39,7 +51,7 @@ class DependencyValidator:
                 if dep is None:
                     missing.append((task.id, dep_id))
                     continue
-                if dep.status in self._STUCK_STATUSES:
+                if dep.status in self._STUCK_STATUSES and dep_id not in satisfied:
                     stuck.append((task.id, dep_id, dep.status.value))
 
         cycles = self._find_cycles(tasks)
